@@ -187,7 +187,10 @@ def scale(x, b):
 
 
 # Sampling from (reach - (safe + unsafe))
-x = scale(torch.rand(3000, 2), cavoid.reach_space)
+n_cuts = 80
+x = torch.linspace(0, 1 - 1/n_cuts, n_cuts)
+x = torch.cartesian_prod(x, x)
+x = scale(x, cavoid.reach_space)
 neg_safe = ~in_(cavoid.safe_space, x)
 # for unsafe_space in cavoid.unsafe_spaces:
 #     mask.logical_and_(~in_(unsafe_space, x))
@@ -231,7 +234,7 @@ def simulate(x):
         print(f'=== step {i} ===')
         x = X[-1]
         x_nxt = cavoid.next(x, p(x)).detach()
-        # x_nxt = cavoid.add_noise(x_nxt)
+        x_nxt = cavoid.add_noise(x_nxt)
         X.append(x_nxt)
         ax.scatter(x[:, 0], x[:, 1], s=1)
         reach = in_(cavoid.safe_space, x).sum()
@@ -249,11 +252,19 @@ def simulate(x):
     plt.ioff()
 
 
-def dupstate(x, dupfact=16):
-    x1 = torch.unsqueeze(x, dim=0)
-    x1 = x1.expand(dupfact, -1, -1)
-    x1 = x1.flatten(end_dim=1)
-    return x1
+def exp_v(x, V):
+    def dupstate(x, dupfact=16):
+        x1 = torch.unsqueeze(x, dim=0)
+        x1 = x1.expand(dupfact, -1, -1)
+        x1 = x1.flatten(end_dim=1)
+        return x1
+    x1 = dupstate(x)
+    x1 = cavoid.add_noise(x1)
+    v = V(x1)
+    v1 = torch.cat(v.split(x.shape[0]), dim=1)
+    v1 = v1.mean(dim=1)
+    v1 = v1.unsqueeze(dim=1)
+    return v1
 
 
 p_ReachAvoid = 0.95
@@ -268,7 +279,7 @@ class Learner_ReachAvoid:
 
     def init_optimizer(self, lr):
         return torch.optim.SGD(
-            list(self.V.parameters()), lr=lr)
+            list(self.V.parameters()) + list(p.parameters()), lr=lr)
 
     def loss(self, x):
         x_nxt = cavoid.next(x, p(x))
@@ -278,55 +289,56 @@ class Learner_ReachAvoid:
         init = in2_(cavoid.init_spaces, x).unsqueeze(dim=1)
         l_init = (torch.relu(self.V(x) - barrier) * init).mean()
 
-        # Duplicating to add noise
-        x1 = dupstate(x)
-        x_nxt1 = dupstate(x_nxt)
-        x_nxt1 = cavoid.add_noise(x_nxt1)
-
         # Any unsafe state should be above barrier
-        unsafe = in2_(cavoid.unsafe_spaces, x1).unsqueeze(dim=1)
+        unsafe = in2_(cavoid.unsafe_spaces, x).unsqueeze(dim=1)
         l_unsafe = (
-            torch.relu(barrier - self.V(x1)) * unsafe).mean()
-
+            torch.relu(barrier - self.V(x)) * unsafe).mean()
+        # Comment the following line to
+        # take the unsafe condition into account.
+        # This condition doesn't need to be satisfied,
+        # as the certificate can be constant
+        # across any unsafe region.
+        # l_unsafe = 0
         # Not unsafe, but maybe above barrier
-        barrier_le = (self.V(x1) <= barrier) * ~unsafe
+        barrier_le = (self.V(x) <= barrier) * ~unsafe
+        v_nxt = exp_v(x_nxt, self.V)
         l_dec = (
             torch.relu(
-                self.V(x_nxt1) - self.V(x1) + 1e-3) * barrier_le).mean()
+                v_nxt - self.V(x) + 1e-2) * barrier_le).mean()
 
         return l_init + l_unsafe + l_dec
 
     def chk(self, x):
         x_nxt = cavoid.next(x, p(x))
-        x1 = dupstate(x)
-        x_nxt1 = dupstate(x_nxt)
-        x_nxt1 = cavoid.add_noise(x_nxt1)
 
         barrier = 1 / (1 - p_ReachAvoid)
-        init = in2_(cavoid.init_spaces, x1).unsqueeze(dim=1)
-        c_init = (self.V(x1) <= barrier) * init + 1 * ~init
+        init = in2_(cavoid.init_spaces, x).unsqueeze(dim=1)
+        c_init = (self.V(x) <= barrier) * init + 1 * ~init
 
-        # nxt_unsafe = in2_(cavoid.unsafe_spaces, x_nxt1).unsqueeze(dim=1)
-        # c_unsafe = (
-        #     (self.V(x_nxt1) >= barrier) * nxt_unsafe
-        #     + 1 * ~nxt_unsafe)
-        unsafe = in2_(cavoid.unsafe_spaces, x1).unsqueeze(dim=1)
-        c_unsafe = (self.V(x1) >= barrier) * unsafe + 1 * ~unsafe
-        barrier_le = (self.V(x1) <= barrier) * ~unsafe
+        unsafe = in2_(cavoid.unsafe_spaces, x).unsqueeze(dim=1)
+        c_unsafe = (self.V(x) >= barrier) * unsafe + 1 * ~unsafe
+        # Comment the following line to
+        # take the unsafe condition into account.
+        # This condition doesn't need to be satisfied,
+        # as the certificate can be constant
+        # across any unsafe region.
+        # c_unsafe = torch.ones_like(c_init)
+        barrier_le = (self.V(x) <= barrier) * ~unsafe
+        v_nxt = exp_v(x_nxt, self.V)
         c_dec = (
-            (self.V(x1) >= self.V(x_nxt1) + 1e-3) * barrier_le
+            (self.V(x) >= v_nxt + 1e-3) * barrier_le
             + 1 * ~barrier_le)
 
         chk = c_init
         chk.logical_and_(c_unsafe)
         chk.logical_and_(c_dec)
-        return chk.float().mean() * 100
+        return chk.float().mean() * 100, chk
 
     def fit(self, S, n_epoch=512, batch_size=100, lr=1e-3, gamma=1.0):
         def training_step(s, optimizer):
             optimizer.zero_grad()
             loss = self.loss(s)
-            chk = self.chk(s)
+            chk, _ = self.chk(s)
             loss.backward(retain_graph=True)
             optimizer.step()
             return loss, chk
@@ -340,7 +352,7 @@ class Learner_ReachAvoid:
                 print(
                     f'Epoch {e:>6}, '
                     + f'Loss={self.loss(S):12.6f}, '
-                    + f'Chk={self.chk(S):12.6f}, '
+                    + f'Chk={self.chk(S)[0]:12.6f}, '
                 )
                 # if self.chk(S) == 100.0:
                 #     return
@@ -362,4 +374,14 @@ def nn_ReachAvoid(n_dims):
 simulate(x)
 
 learner = Learner_ReachAvoid(2, [nn_ReachAvoid(2)])
-learner.fit(x, n_epoch=256, batch_size=100, lr=1e-3)
+learner.fit(x, n_epoch=512, batch_size=120, lr=2e-3)
+
+_, chk = learner.chk(x)
+plt.scatter(x[:, 0], x[:, 1], s=2, c=chk[:x.shape[0], :])
+plt.show()
+plt.close()
+
+v = learner.V(x).detach()
+plt.scatter(x[:, 0], x[:, 1], s=2, c=v)
+plt.show()
+plt.close()
