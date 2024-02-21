@@ -287,18 +287,12 @@ class Learner_ReachAvoid:
         # Any init state should be below 1
         barrier = 1 / (1 - p_ReachAvoid)
         init = in2_(cavoid.init_spaces, x).unsqueeze(dim=1)
-        l_init = (torch.relu(self.V(x) - barrier) * init).mean()
+        l_init = (torch.relu(self.V(x) - 1) * init).mean()
 
         # Any unsafe state should be above barrier
         unsafe = in2_(cavoid.unsafe_spaces, x).unsqueeze(dim=1)
         l_unsafe = (
             torch.relu(barrier - self.V(x)) * unsafe).mean()
-        # Comment the following line to
-        # take the unsafe condition into account.
-        # This condition doesn't need to be satisfied,
-        # as the certificate can be constant
-        # across any unsafe region.
-        # l_unsafe = 0
         # Not unsafe, but maybe above barrier
         barrier_le = (self.V(x) <= barrier) * ~unsafe
         v_nxt = exp_v(x_nxt, self.V)
@@ -313,16 +307,10 @@ class Learner_ReachAvoid:
 
         barrier = 1 / (1 - p_ReachAvoid)
         init = in2_(cavoid.init_spaces, x).unsqueeze(dim=1)
-        c_init = (self.V(x) <= barrier) * init + 1 * ~init
+        c_init = (self.V(x) <= 1) * init + 1 * ~init
 
         unsafe = in2_(cavoid.unsafe_spaces, x).unsqueeze(dim=1)
         c_unsafe = (self.V(x) >= barrier) * unsafe + 1 * ~unsafe
-        # Comment the following line to
-        # take the unsafe condition into account.
-        # This condition doesn't need to be satisfied,
-        # as the certificate can be constant
-        # across any unsafe region.
-        # c_unsafe = torch.ones_like(c_init)
         barrier_le = (self.V(x) <= barrier) * ~unsafe
         v_nxt = exp_v(x_nxt, self.V)
         c_dec = (
@@ -373,8 +361,12 @@ def nn_ReachAvoid(n_dims):
 
 simulate(x)
 
+plt.scatter(x[:, 0], x[:, 1], s=2)
+plt.show()
+plt.close()
+
 learner = Learner_ReachAvoid(2, [nn_ReachAvoid(2)])
-learner.fit(x, n_epoch=512, batch_size=120, lr=2e-3)
+learner.fit(x, n_epoch=200, batch_size=120, lr=3e-2)
 
 _, chk = learner.chk(x)
 plt.scatter(x[:, 0], x[:, 1], s=2, c=chk[:x.shape[0], :])
