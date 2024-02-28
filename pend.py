@@ -85,6 +85,13 @@ def in_(b, p):
     return res
 
 
+def in2_(bs, p):
+    res = torch.zeros(p.shape[0])
+    for b in bs:
+        res = torch.logical_or(res, in_(b, p))
+    return res
+
+
 def jax_load(params, filename):
     with open(filename, "rb") as f:
         bytes_v = f.read()
@@ -181,6 +188,9 @@ plt.close()
 plt.ioff()
 
 
+p_ReachAvoid = 0.9
+
+
 class Learner_ReachAvoid:
     def __init__(self, n_dims, models):
         # Abstraction A comes with a delta; so A is a non-deterministic
@@ -193,35 +203,45 @@ class Learner_ReachAvoid:
             list(self.V.parameters()), lr=lr)
 
     def loss(self, x):
-        """Aggregate loss function for the certificate NN.
-
-        New components can be added to the loss by defining new
-        functions and calling them in the expression evaluated below.
-        """
-        # Adding delta * ball to account for non-determinism
         x_nxt = pend.next(x, p(x))
-        l_dec = torch.relu(self.V(x_nxt) - self.V(x) + 1).mean()
-        l_safe1 = torch.relu(self.V(x) - 1e2).mean()
-        l_safe2 = torch.relu(self.V(x_nxt) - 1e2).mean()
-        nxt_unsafe = (
-            in_(pend.unsafe_spaces[0], x_nxt)
-            + in_(pend.unsafe_spaces[1], x_nxt))
-        l_nxt_unsafe = (
-            torch.relu(1e2 - self.V(x_nxt)) * nxt_unsafe).mean()
-        return l_dec + l_safe1 + l_safe2 + l_nxt_unsafe
+
+        # Any init state should be below 1
+        barrier = 1 / (1 - p_ReachAvoid)
+        init = in_(pend.init_spaces[0], x).unsqueeze(dim=1)
+        l_init = (torch.relu(self.V(x) - 1) * init).mean()
+
+        # Any unsafe state should be above barrier
+        unsafe = in2_(pend.unsafe_spaces, x).unsqueeze(dim=1)
+        l_unsafe = (
+            torch.relu(barrier - self.V(x)) * unsafe).mean()
+        # Not unsafe, but maybe above barrier
+        barrier_le = (self.V(x) <= barrier) * ~unsafe
+        v_nxt = self.V(x_nxt)
+        l_dec = (
+            torch.relu(
+                v_nxt - self.V(x) + 1e-2) * barrier_le).mean()
+
+        return l_init + l_unsafe + l_dec
 
     def chk(self, x):
         x_nxt = pend.next(x, p(x))
-        c_dec = self.V(x) >= self.V(x_nxt) + 1e-3
-        c_safe1 = self.V(x) <= 1e2
-        c_safe2 = self.V(x_nxt) <= 1e2
-        nxt_unsafe = (
-            in_(pend.unsafe_spaces[0], x_nxt)
-            + in_(pend.unsafe_spaces[1], x_nxt))
-        c_nxt_unsafe = (
-            (self.V(x_nxt) >= 1e2) * nxt_unsafe
-            + 1 * ~nxt_unsafe)
-        return (c_dec * c_safe1 * c_safe2 * c_nxt_unsafe).float().mean() * 100
+
+        barrier = 1 / (1 - p_ReachAvoid)
+        init = in_(pend.init_spaces[0], x).unsqueeze(dim=1)
+        c_init = (self.V(x) <= 1) * init + 1 * ~init
+
+        unsafe = in2_(pend.unsafe_spaces, x).unsqueeze(dim=1)
+        c_unsafe = (self.V(x) >= barrier) * unsafe + 1 * ~unsafe
+        barrier_le = (self.V(x) <= barrier) * ~unsafe
+        v_nxt = self.V(x_nxt)
+        c_dec = (
+            (self.V(x) >= v_nxt + 1e-3) * barrier_le
+            + 1 * ~barrier_le)
+
+        chk = c_init
+        chk.logical_and_(c_unsafe)
+        chk.logical_and_(c_dec)
+        return chk.float().mean() * 100
 
     def fit(self, S, n_epoch=512, batch_size=100, lr=1e-3, gamma=1.0):
         def training_step(s, optimizer):
